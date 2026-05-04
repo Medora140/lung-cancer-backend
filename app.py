@@ -1,6 +1,11 @@
 import os
 import io
 import sys
+
+# DEBUG & HARD FAIL CHECK
+print("PYTHON VERSION:", sys.version)
+assert "3.11" in sys.version, f"WRONG PYTHON VERSION ON RENDER: {sys.version}. Expected 3.11.x"
+
 import base64
 import numpy as np
 import tensorflow as tf
@@ -9,7 +14,8 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image
 
-print(f"PYTHON VERSION: {sys.version}")
+# Removed old print statement from below
+
 
 app = Flask(__name__)
 CORS(app) # Enable CORS for all routes
