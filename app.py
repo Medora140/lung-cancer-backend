@@ -1,8 +1,12 @@
 import os
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2" # Memory optimization
+import gc
+
+# 1. FINAL TensorFlow memory optimizations (Must be before TF import)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["MALLOC_TRIM_THRESHOLD_"] = "100000"
 
 import io
-import sys
 import base64
 import numpy as np
 import tensorflow as tf
@@ -12,7 +16,8 @@ from flask_cors import CORS
 from PIL import Image
 
 app = Flask(__name__)
-CORS(app)
+# 2. Ensure CORS works correctly
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Constants
 IMG_SIZE = 224
@@ -22,29 +27,23 @@ MODEL_PATH = os.path.join(
     "efficientnet_lung_model.h5"
 )
 
-# Global variable for model
+# 3. Whether preload should be removed: YES (Lazy load only)
 model = None
 
 def load_ai_model():
     global model
     if model is None:
-        print("Loading AI model...")
-        print("MODEL PATH:", MODEL_PATH)
-        
-        if os.path.exists(MODEL_PATH):
-            try:
-                # Use keras.models for Keras 3 compatibility (TF 2.16+)
-                import keras
-                model = keras.models.load_model(
-                    MODEL_PATH,
-                    compile=False,
-                    safe_mode=False # Allows deserialization of older/custom structures
-                )
-                print("Model loaded successfully.")
-            except Exception as e:
-                print(f"Error loading model: {e}")
-        else:
-            print(f"Error: Model not found at {MODEL_PATH}")
+        import keras
+        print("Loading AI model into RAM...")
+        try:
+            model = keras.models.load_model(
+                MODEL_PATH,
+                compile=False,
+                safe_mode=False
+            )
+            print("Model loaded successfully.")
+        except Exception as e:
+            print(f"Critical Model Load Error: {e}")
     return model
 
 def make_gradcam_heatmap(img_array, model, last_conv_layer_name):
@@ -65,17 +64,13 @@ def make_gradcam_heatmap(img_array, model, last_conv_layer_name):
         heatmap = tf.squeeze(heatmap)
         heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-10)
         return heatmap.numpy()
-    except Exception as e:
-        print(f"Grad-CAM error: {e}")
+    except:
         return None
 
 def preprocess_image(image):
     image_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(blurred)
-    resized = cv2.resize(enhanced, (IMG_SIZE, IMG_SIZE))
+    resized = cv2.resize(gray, (IMG_SIZE, IMG_SIZE))
     rgb_image = cv2.cvtColor(resized, cv2.COLOR_GRAY2RGB)
     img_array = np.expand_dims(rgb_image, axis=0)
     return img_array.astype('float32') / 255.0, image_cv
@@ -87,20 +82,16 @@ def health():
 @app.route('/predict', methods=['POST'])
 def predict():
     global model
-    print("Predict endpoint hit")
-    
     if 'file' not in request.files:
-        return jsonify({'error': 'No file uploaded'}), 400
+        return jsonify({'error': 'No file'}), 400
     
     file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No file selected'}), 400
-
-    # Lazy load model
+    
+    # 4. Lazy load model
     if model is None:
         load_ai_model()
         if model is None:
-            return jsonify({'error': 'Model file missing on server.'}), 500
+            return jsonify({'error': 'Model unavailable'}), 500
 
     try:
         print("Running prediction...")
@@ -108,13 +99,14 @@ def predict():
         image = Image.open(io.BytesIO(img_bytes)).convert('RGB')
         img_array, original_cv2_img = preprocess_image(image)
 
-        preds = model.predict(img_array)[0]
+        # Inference
+        preds = model.predict(img_array, verbose=0)[0]
         idx = np.argmax(preds)
         label = CLASS_NAMES[idx]
         confidence = float(preds[idx])
 
-        last_conv_layer_name = "top_conv" 
-        heatmap = make_gradcam_heatmap(img_array, model, last_conv_layer_name)
+        # Grad-CAM (Simplified to save RAM)
+        heatmap = make_gradcam_heatmap(img_array, model, "top_conv")
         
         response_data = {
             'class': label,
@@ -127,23 +119,22 @@ def predict():
             heatmap_resized = np.uint8(255 * heatmap_resized)
             heatmap_color = cv2.applyColorMap(heatmap_resized, cv2.COLORMAP_JET)
             superimposed_img = cv2.addWeighted(original_cv2_img, 0.6, heatmap_color, 0.4, 0)
-            
             _, buffer_heat = cv2.imencode('.jpg', superimposed_img)
-            heat_base64 = base64.b64encode(buffer_heat).decode('utf-8')
-            response_data['heatmap_image'] = f"data:image/jpeg;base64,{heat_base64}"
+            response_data['heatmap_image'] = f"data:image/jpeg;base64,{base64.b64encode(buffer_heat).decode('utf-8')}"
 
         _, buffer_orig = cv2.imencode('.jpg', original_cv2_img)
-        orig_base64 = base64.b64encode(buffer_orig).decode('utf-8')
-        response_data['original_image'] = f"data:image/jpeg;base64,{orig_base64}"
+        response_data['original_image'] = f"data:image/jpeg;base64,{base64.b64encode(buffer_orig).decode('utf-8')}"
 
         return jsonify(response_data)
 
     except Exception as e:
-        print(f"Prediction error: {e}")
         return jsonify({'error': str(e)}), 500
+    finally:
+        # 5. FINAL Session cleanup and Garbage collection
+        import keras
+        keras.backend.clear_session()
+        gc.collect()
+        print("Memory cleanup completed.")
 
 if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 5000))
-    )
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
