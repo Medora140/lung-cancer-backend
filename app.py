@@ -10,43 +10,39 @@ import io
 import base64
 import numpy as np
 import cv2
+import threading
+import uuid
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app)
 
 IMG_SIZE = 224
 CLASS_NAMES = ["Adenocarcinoma", "Large Cell Carcinoma", "Normal", "Squamous Cell Carcinoma"]
-MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "efficientnet_lung_model.h5"
-)
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "efficientnet_lung_model.h5")
 
 model = None
+heatmap_store = {}
 
 def load_ai_model():
     global model
     if model is None:
         import keras
-        print("Loading AI model into RAM...")
         try:
-            model = keras.models.load_model(
-                MODEL_PATH,
-                compile=False,
-                safe_mode=False
-            )
-            print("Model loaded successfully.")
+            model = keras.models.load_model(MODEL_PATH, compile=False, safe_mode=False)
         except Exception as e:
-            print(f"Critical Model Load Error: {e}")
+            print(f"Error: {e}")
     return model
 
-def make_gradcam_heatmap(img_array, model, last_conv_layer_name):
+def generate_heatmap_async(job_id, img_array, original_cv2_img):
+    global model
     try:
+        # GradCAM logic
         grad_model = tf.keras.models.Model(
             [model.inputs],
-            [model.get_layer(last_conv_layer_name).output, model.output]
+            [model.get_layer("top_conv").output, model.output]
         )
         with tf.GradientTape() as tape:
             conv_outputs, predictions = grad_model(img_array)
@@ -59,17 +55,20 @@ def make_gradcam_heatmap(img_array, model, last_conv_layer_name):
         heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
         heatmap = tf.squeeze(heatmap)
         heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-10)
-        return heatmap.numpy()
-    except:
-        return None
-
-def preprocess_image(image):
-    image_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-    gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
-    resized = cv2.resize(gray, (IMG_SIZE, IMG_SIZE))
-    rgb_image = cv2.cvtColor(resized, cv2.COLOR_GRAY2RGB)
-    img_array = np.expand_dims(rgb_image, axis=0)
-    return img_array.astype('float32') / 255.0, image_cv
+        
+        # Processing heatmap
+        heatmap_np = heatmap.numpy()
+        heatmap_resized = cv2.resize(heatmap_np, (original_cv2_img.shape[1], original_cv2_img.shape[0]))
+        heatmap_resized = np.uint8(255 * heatmap_resized)
+        heatmap_color = cv2.applyColorMap(heatmap_resized, cv2.COLORMAP_JET)
+        superimposed_img = cv2.addWeighted(original_cv2_img, 0.6, heatmap_color, 0.4, 0)
+        
+        _, buffer = cv2.imencode('.jpg', superimposed_img)
+        b64_heatmap = base64.b64encode(buffer).decode('utf-8')
+        heatmap_store[job_id] = f"data:image/jpeg;base64,{b64_heatmap}"
+    except Exception as e:
+        print(f"Async GradCAM Error: {e}")
+        heatmap_store[job_id] = None
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -81,48 +80,57 @@ def predict():
     if 'file' not in request.files:
         return jsonify({'error': 'No file'}), 400
     
-    file = request.files['file']
-    
     if model is None:
         load_ai_model()
-        if model is None:
-            return jsonify({'error': 'Model unavailable'}), 500
 
     try:
-        print("Running prediction...")
-        img_bytes = file.read()
-        image = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-        img_array, original_cv2_img = preprocess_image(image)
+        file = request.files['file']
+        image = Image.open(io.BytesIO(file.read())).convert('RGB')
+        original_cv2_img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        
+        # Optimized preprocessing
+        img_array = np.array(image.resize((IMG_SIZE, IMG_SIZE))).astype("float32") / 255.0
+        img_array = np.expand_dims(img_array, axis=0)
 
         preds = model.predict(img_array, verbose=0)[0]
         idx = np.argmax(preds)
         label = CLASS_NAMES[idx]
         confidence = float(preds[idx])
 
-        heatmap = make_gradcam_heatmap(img_array, model, "top_conv")
+        job_id = str(uuid.uuid4())
+        heatmap_store[job_id] = "processing"
         
-        response_data = {
-            'class': label,
-            'confidence': round(confidence * 100, 2),
-            'all_predictions': {CLASS_NAMES[i]: round(float(preds[i]) * 100, 2) for i in range(len(CLASS_NAMES))}
-        }
-
-        if heatmap is not None:
-            heatmap_resized = cv2.resize(heatmap, (original_cv2_img.shape[1], original_cv2_img.shape[0]))
-            heatmap_resized = np.uint8(255 * heatmap_resized)
-            heatmap_color = cv2.applyColorMap(heatmap_resized, cv2.COLORMAP_JET)
-            superimposed_img = cv2.addWeighted(original_cv2_img, 0.6, heatmap_color, 0.4, 0)
-            _, buffer_heat = cv2.imencode('.jpg', superimposed_img)
-            response_data['heatmap_image'] = f"data:image/jpeg;base64,{base64.b64encode(buffer_heat).decode('utf-8')}"
+        # Start background task
+        threading.Thread(target=generate_heatmap_async, args=(job_id, img_array, original_cv2_img)).start()
 
         _, buffer_orig = cv2.imencode('.jpg', original_cv2_img)
-        response_data['original_image'] = f"data:image/jpeg;base64,{base64.b64encode(buffer_orig).decode('utf-8')}"
+        base64_image = f"data:image/jpeg;base64,{base64.b64encode(buffer_orig).decode('utf-8')}"
 
-        return jsonify(response_data)
+        result = {
+            "class": label,
+            "confidence": round(confidence * 100, 2),
+            "job_id": job_id,
+            "original_image": base64_image
+        }
+
+        # Memory Cleanup
+        del preds
+        del img_array
+
+        return jsonify(result)
 
     except Exception as e:
-        print("Prediction error:", str(e))
         return jsonify({'error': str(e)}), 500
+
+@app.route('/heatmap/<job_id>', methods=['GET'])
+def get_heatmap(job_id):
+    status = heatmap_store.get(job_id)
+    if status == "processing":
+        return jsonify({"status": "processing"})
+    elif status is None:
+        return jsonify({"status": "failed"})
+    else:
+        return jsonify({"status": "completed", "heatmap_image": status})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
