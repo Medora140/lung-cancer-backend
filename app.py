@@ -29,15 +29,16 @@ def load_ai_model():
     global model
     if model is None:
         print("Loading AI model...")
-        print("Current directory:", os.getcwd())
         print("MODEL PATH:", MODEL_PATH)
-        print("MODEL EXISTS:", os.path.exists(MODEL_PATH))
         
         if os.path.exists(MODEL_PATH):
             try:
-                model = tf.keras.models.load_model(
+                # Use keras.models for Keras 3 compatibility (TF 2.16+)
+                import keras
+                model = keras.models.load_model(
                     MODEL_PATH,
-                    compile=False
+                    compile=False,
+                    safe_mode=False # Allows deserialization of older/custom structures
                 )
                 print("Model loaded successfully.")
             except Exception as e:
