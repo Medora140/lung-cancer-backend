@@ -23,7 +23,10 @@ CORS(app) # Enable CORS for all routes
 # Constants
 IMG_SIZE = 224
 CLASS_NAMES = ["Adenocarcinoma", "Large Cell Carcinoma", "Normal", "Squamous Cell Carcinoma"]
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "efficientnet_lung_model.h5")
+MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "efficientnet_lung_model.h5"
+)
 
 # Global variable for model
 model = None
@@ -31,6 +34,10 @@ model = None
 def load_ai_model():
     global model
     if model is None:
+        print("Current directory:", os.getcwd())
+        print("Files in directory:", os.listdir())
+        print("MODEL PATH:", MODEL_PATH)
+        print("MODEL EXISTS:", os.path.exists(MODEL_PATH))
         if os.path.exists(MODEL_PATH):
             try:
                 # Load model without compiling to save memory
