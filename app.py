@@ -1,25 +1,22 @@
 import os
-import gc
-
-# 1. FINAL TensorFlow memory optimizations (Must be before TF import)
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-os.environ["MALLOC_TRIM_THRESHOLD_"] = "100000"
+
+import tensorflow as tf
+tf.config.threading.set_inter_op_parallelism_threads(1)
+tf.config.threading.set_intra_op_parallelism_threads(1)
 
 import io
 import base64
 import numpy as np
-import tensorflow as tf
 import cv2
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image
 
 app = Flask(__name__)
-# 2. Ensure CORS works correctly
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Constants
 IMG_SIZE = 224
 CLASS_NAMES = ["Adenocarcinoma", "Large Cell Carcinoma", "Normal", "Squamous Cell Carcinoma"]
 MODEL_PATH = os.path.join(
@@ -27,7 +24,6 @@ MODEL_PATH = os.path.join(
     "efficientnet_lung_model.h5"
 )
 
-# 3. Whether preload should be removed: YES (Lazy load only)
 model = None
 
 def load_ai_model():
@@ -87,7 +83,6 @@ def predict():
     
     file = request.files['file']
     
-    # 4. Lazy load model
     if model is None:
         load_ai_model()
         if model is None:
@@ -99,13 +94,11 @@ def predict():
         image = Image.open(io.BytesIO(img_bytes)).convert('RGB')
         img_array, original_cv2_img = preprocess_image(image)
 
-        # Inference
         preds = model.predict(img_array, verbose=0)[0]
         idx = np.argmax(preds)
         label = CLASS_NAMES[idx]
         confidence = float(preds[idx])
 
-        # Grad-CAM (Simplified to save RAM)
         heatmap = make_gradcam_heatmap(img_array, model, "top_conv")
         
         response_data = {
@@ -128,13 +121,8 @@ def predict():
         return jsonify(response_data)
 
     except Exception as e:
+        print("Prediction error:", str(e))
         return jsonify({'error': str(e)}), 500
-    finally:
-        # 5. FINAL Session cleanup and Garbage collection
-        import keras
-        keras.backend.clear_session()
-        gc.collect()
-        print("Memory cleanup completed.")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
